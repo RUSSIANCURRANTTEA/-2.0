@@ -1,0 +1,347 @@
+// Основной заголовок
+#include <SoftwareSerial.h>
+#include <math.h>
+
+// Константы и структуры
+#define MAX_MODELS 9
+
+struct ModelResult {
+  float risk;
+  String level;
+  String recommendation;
+};
+
+struct DiseaseProbability {
+  float probability; // 0-100%
+  String riskCategory;
+  String colorCode;
+  bool treatmentRequired;
+};
+
+struct TreatmentDate {
+  bool treatmentNeeded;
+  String bestDate;
+  int daysToTreatment;
+  String fungicideType;
+  float applicationRate;
+};
+
+// Основные функции
+void setup() {
+  Serial.begin(115200);
+  zigbeeSerial.begin(115200);
+  // Инициализация
+}
+
+void loop() {
+  receiveZigbeeData();
+  performAnalysis();
+  processCommands();
+}
+
+// 1. Метод Уоллина
+float calculateWallin(float temp, float hum, float leafWet) {
+  if (temp >= 10 && temp <= 25) {
+    if (hum >= 90 && leafWet >= 6) return 0.8;
+    if (hum >= 80 && leafWet >= 4) return 0.5;
+  }
+  return 0.1;
+}
+
+// 2. BLITECAST
+int countFavorableDays(DailyData history[], int count) {
+  int favorable = 0;
+  for (int i = 0; i < count; i++) {
+    if (isFavorableDay(history[i])) favorable++;
+  }
+  return favorable;
+}
+
+// 3. Метод градусо-часов
+float calculateDegreeHours(float temps[]) {
+  float degreeHours = 0;
+  for (int i = 0; i < 24; i++) {
+    if (temps[i] >= 7 && temps[i] <= 30) {
+      if (temps[i] >= 15 && temps[i] <= 25) degreeHours += 1.0;
+      else degreeHours += 0.5;
+    }
+  }
+  return degreeHours / 100.0;
+}
+
+// 4. Метод влажности
+float calculateHumidityDuration(float humidity[]) {
+  int highHumidityHours = 0;
+  for (int i = 0; i < 24; i++) {
+    if (humidity[i] >= 90) highHumidityHours++;
+  }
+  if (highHumidityHours >= 10) return 1.0;
+  if (highHumidityHours >= 8) return 0.8;
+  if (highHumidityHours >= 6) return 0.6;
+  if (highHumidityHours >= 4) return 0.3;
+  return 0.0;
+}
+
+// 5. Метод точки росы
+float calculateDewPointRisk(float temp, float hum) {
+  float dewPoint = calculateDewPoint(temp, hum);
+  float deltaT = temp - dewPoint;
+  if (deltaT <= 1) return 1.0;
+  if (deltaT <= 2) return 0.8;
+  if (deltaT <= 3) return 0.5;
+  if (deltaT <= 4) return 0.2;
+  return 0.0;
+}
+
+// 6. Комбинированный индекс
+float calculateCombinedIndex(float temp, float hum, float rain, 
+                           float leafWet, float wind) {
+  float tempFactor = (temp >= 15 && temp <= 25) ? 1.0 : 0.5;
+  float humFactor = hum / 100.0;
+  float rainFactor = min(rain / 10.0, 1.0);
+  float wetnessFactor = min(leafWet / 12.0, 1.0);
+  float windFactor = max(0, 1 - wind / 8.0);
+  
+  return (tempFactor * 0.3 + humFactor * 0.25 + rainFactor * 0.2 +
+          wetnessFactor * 0.15 + windFactor * 0.1);
+}
+
+// 7. Экспертная система
+float calculateExpertSystem(DailyData& data) {
+  float score = 0;
+  if (data.temp >= 15 && data.temp <= 25) score += 0.3;
+  if (data.humidity >= 90) score += 0.3;
+  if (data.leafWetness >= 8) score += 0.2;
+  if (data.rainfall > 5) score += 0.2;
+  return min(score, 1.0);
+}
+
+// 8. Солнечная радиация
+float calculateSolarRadiationRisk(float solarRad) {
+  float solarFactor = solarRad / 1000.0;
+  return max(0, 1 - solarFactor * 0.7); // Солнце снижает риск
+}
+
+// 9. Почвенный индекс (SSSI)
+float calculateSSSI(float soilMoisture, float soilTemp) {
+  float moistureFactor = soilMoisture >= 85 ? 1.0 : 
+                        soilMoisture >= 70 ? 0.5 : 0.0;
+  float tempFactor = (soilTemp >= 15 && soilTemp <= 25) ? 1.0 : 
+                    (soilTemp >= 10 && soilTemp <= 30) ? 0.5 : 0.0;
+  return moistureFactor * tempFactor;
+}
+
+// ОСНОВНАЯ ФУНКЦИЯ: Расчёт вероятности фитофтороза
+DiseaseProbability calculatePhytophthoraProbability(DailyData& current,
+                                                   DailyData history[],
+                                                   int historyCount) {
+  DiseaseProbability result = {0, "НИЗКИЙ", "🟢", false};
+  
+  // Собираем результаты всех моделей
+  float modelResults[MAX_MODELS];
+  
+  modelResults[0] = calculateWallin(current.temp, current.humidity, 
+                                   current.leafWetness);
+  modelResults[1] = countFavorableDays(history, historyCount) / 15.0;
+  modelResults[2] = calculateDegreeHours(current.hourlyTemps);
+  modelResults[3] = calculateHumidityDuration(current.hourlyHumidity);
+  modelResults[4] = calculateDewPointRisk(current.temp, current.humidity);
+  modelResults[5] = calculateCombinedIndex(current.temp, current.humidity,
+                                          current.rainfall, current.leafWetness,
+                                          current.windSpeed);
+  modelResults[6] = calculateExpertSystem(current);
+  modelResults[7] = calculateSolarRadiationRisk(current.solarRadiation);
+  modelResults[8] = calculateSSSI(current.soilMoisture, current.soilTemp);
+  
+  // Взвешенное среднее
+  float weights[MAX_MODELS] = {0.15, 0.12, 0.10, 0.12, 0.10, 
+                               0.15, 0.12, 0.08, 0.06};
+  
+  float totalRisk = 0;
+  for (int i = 0; i < MAX_MODELS; i++) {
+    totalRisk += modelResults[i] * weights[i];
+  }
+  
+  // Конвертация в проценты
+  result.probability = totalRisk * 100;
+  
+  // Определение категории риска
+  if (result.probability >= 80) {
+    result.riskCategory = "КРИТИЧЕСКИЙ";
+    result.colorCode = "🟣";
+    result.treatmentRequired = true;
+  } 
+  else if (result.probability >= 60) {
+    result.riskCategory = "ВЫСОКИЙ";
+    result.colorCode = "🔴";
+    result.treatmentRequired = true;
+  }
+  else if (result.probability >= 40) {
+    result.riskCategory = "ПОВЫШЕННЫЙ";
+    result.colorCode = "🟠";
+    result.treatmentRequired = (current.blitecast.riskPeriod || 
+                               current.humidityHours90 > 6);
+  }
+  else if (result.probability >= 20) {
+    result.riskCategory = "УМЕРЕННЫЙ";
+    result.colorCode = "🟡";
+    result.treatmentRequired = false;
+  }
+  else {
+    result.riskCategory = "НИЗКИЙ";
+    result.colorCode = "🟢";
+    result.treatmentRequired = false;
+  }
+  
+  return result;
+}
+
+// ФУНКЦИЯ: Определение лучшей даты обработки
+TreatmentDate calculateBestTreatmentDate(DiseaseProbability& prob,
+                                        DailyData& current,
+                                        WeatherForecast forecast[]) {
+  TreatmentDate result = {false, "", 0, "", 0};
+  
+  if (!prob.treatmentRequired) {
+    result.treatmentNeeded = false;
+    return result;
+  }
+  
+  result.treatmentNeeded = true;
+  
+  // Анализ ближайших 7 дней
+  int bestDay = -1;
+  float bestScore = -1;
+  
+  for (int i = 0; i < 7; i++) {
+    if (forecast[i].valid) {
+      float dayScore = evaluateTreatmentDay(forecast[i], current);
+      
+      if (dayScore > bestScore) {
+        bestScore = dayScore;
+        bestDay = i;
+      }
+    }
+  }
+  
+  if (bestDay >= 0) {
+    result.daysToTreatment = bestDay;
+    result.bestDate = formatFutureDate(bestDay);
+    
+    // Выбор фунгицида
+    if (prob.probability >= 70) {
+      result.fungicideType = "СИСТЕМНЫЙ + КОНТАКТНЫЙ";
+      result.applicationRate = 2.2;
+    } 
+    else if (prob.probability >= 50) {
+      result.fungicideType = "КОНТАКТНО-СИСТЕМНЫЙ";
+      result.applicationRate = 1.8;
+    }
+    else {
+      result.fungicideType = "КОНТАКТНЫЙ (профилактический)";
+      result.applicationRate = 1.5;
+    }
+  }
+  
+  return result;
+}
+
+// ФУНКЦИЯ: Оценка дня для обработки
+float evaluateTreatmentDay(WeatherForecast& forecast, DailyData& current) {
+  float score = 100.0;
+  
+  // Вычитаем баллы за плохие условия
+  if (forecast.rainfall > 0) score -= 40;
+  if (forecast.humidity > 85) score -= 20;
+  if (forecast.windSpeed > 5) score -= 30;
+  if (forecast.temperature < 10 || forecast.temperature > 25) score -= 15;
+  
+  // Добавляем баллы за хорошие условия
+  if (forecast.rainfall == 0) score += 20;
+  if (forecast.humidity < 70) score += 10;
+  if (forecast.windSpeed >= 2 && forecast.windSpeed <= 4) score += 10;
+  if (forecast.temperature >= 15 && forecast.temperature <= 22) score += 15;
+  
+  return max(score, 0.0);
+}
+
+// ФУНКЦИЯ: Вывод результатов
+void printPhytophthoraAnalysis() {
+  if (agroHistoryIndex == 0) return;
+  
+  DailyData& latest = agroHistory[agroHistoryIndex];
+  DiseaseProbability prob = calculatePhytophthoraProbability(latest, 
+                                                           agroHistory, 
+                                                           agroHistoryIndex);
+  
+  WeatherForecast forecast[7];
+  initializeForecast(forecast);
+  TreatmentDate treatment = calculateBestTreatmentDate(prob, latest, forecast);
+  
+  Serial.println("\n" + String('=') * 60);
+  Serial.println("🌱 ПРОГНОЗ ФИТОФТОРОЗА И РЕКОМЕНДАЦИИ");
+  Serial.println(String('=') * 60);
+  
+  Serial.print("ВЕРОЯТНОСТЬ РАЗВИТИЯ: ");
+  Serial.print(prob.probability, 1);
+  Serial.println("%");
+  
+  Serial.print("УРОВЕНЬ РИСКА: ");
+  Serial.print(prob.colorCode);
+  Serial.print(" ");
+  Serial.println(prob.riskCategory);
+  
+  Serial.print("ОБРАБОТКА ТРЕБУЕТСЯ: ");
+  Serial.println(prob.treatmentRequired ? "ДА ⚠" : "НЕТ ✓");
+  
+  if (treatment.treatmentNeeded) {
+    Serial.println("\n💊 РЕКОМЕНДАЦИИ ПО ОБРАБОТКЕ:");
+    Serial.print("Лучшая дата: ");
+    Serial.println(treatment.bestDate);
+    Serial.print("Дней до обработки: ");
+    Serial.println(treatment.daysToTreatment);
+    Serial.print("Тип фунгицида: ");
+    Serial.println(treatment.fungicideType);
+    Serial.print("Норма расхода: ");
+    Serial.print(treatment.applicationRate, 1);
+    Serial.println(" л/га");
+    
+    Serial.println("\n📋 ПЛАН ОБРАБОТКИ:");
+    if (treatment.daysToTreatment == 0) {
+      Serial.println("1. ОБРАБОТКА СЕГОДНЯ (10:00-16:00)");
+    } else if (treatment.daysToTreatment == 1) {
+      Serial.println("1. Подготовка сегодня");
+      Serial.println("2. ОБРАБОТКА ЗАВТРА (утро)");
+    } else {
+      Serial.println("1. Мониторинг условий (" + String(treatment.daysToTreatment) + " дней)");
+      Serial.println("2. Подготовка за 1 день до");
+      Serial.println("3. ОБРАБОТКА " + treatment.bestDate);
+    }
+  } else {
+    Serial.println("\n✅ ОБРАБОТКА НЕ ТРЕБУЕТСЯ");
+    Serial.println("Следующая оценка через 3 дня.");
+  }
+  
+  Serial.println("\n🎯 РЕЗУЛЬТАТЫ 9 МОДЕЛЕЙ:");
+  Serial.println("1. Уоллин: " + String(latest.wallinRisk, 2));
+  Serial.println("2. BLITECAST: " + String(latest.blitecastScore, 2));
+  Serial.println("3. Градусо-часы: " + String(latest.degreeHours, 2));
+  Serial.println("4. Влажность: " + String(latest.humidityRisk, 2));
+  Serial.println("5. Точка росы: " + String(latest.dewPointRisk, 2));
+  Serial.println("6. Комбинированный: " + String(latest.combinedRisk, 2));
+  Serial.println("7. Экспертная: " + String(latest.expertRisk, 2));
+  Serial.println("8. Солнечная: " + String(latest.solarRisk, 2));
+  Serial.println("9. Почвенная: " + String(latest.soilRisk, 2));
+  
+  Serial.println(String('=') * 60);
+}
+
+// Обработка команды PROBABILITY
+void processProbabilityCommand() {
+  printPhytophthoraAnalysis();
+}
+
+// Обработка команды TREATMENT
+void processTreatmentCommand() {
+  printPhytophthoraAnalysis();
+}
