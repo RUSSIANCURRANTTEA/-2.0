@@ -1,0 +1,239 @@
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <RTClib.h>
+#include <Wire.h>
+
+// Определение пинов
+#define DHTPIN 2
+#define DHTTYPE DHT11
+#define DS18B20_PIN 3
+#define SOIL_PIN A0
+#define UV_PIN A1
+#define WIND_PIN 4
+
+// Инициализация датчиков
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+RTC_DS3231 rtc;
+
+// Переменные
+struct SensorData {
+  float temperature;
+  float humidity;
+  float soilMoisture;
+  float soilTemperature;
+  float uvIntensity;
+  float windSpeed;
+  DateTime time;
+};
+
+SensorData currentData;
+HourlyData hourlyData[24];
+int hourIndex = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200); // Для Zigbee
+  
+  dht.begin();
+  sensors.begin();
+  rtc.begin();
+  
+  pinMode(WIND_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(WIND_PIN), countWindPulses, FALLING);
+}
+
+void loop() {
+  // 1. Сбор данных с датчиков
+  collectSensorData();
+  
+  // 2. Сохранение почасовых данных
+  saveHourlyData();
+  
+  // 3. Расчёт статистики за 24 часа
+  calculate24hStatistics();
+  
+  // 4. Отправка данных по Zigbee
+  if (shouldSendData()) {
+    sendDataViaZigbee();
+  }
+  
+  // 5. Проверка входящих команд
+  checkForCommands();
+  
+  delay(1000);
+}
+
+void collectSensorData() {
+  currentData.temperature = dht.readTemperature();
+  currentData.humidity = dht.readHumidity();
+  
+  sensors.requestTemperatures();
+  currentData.soilTemperature = sensors.getTempCByIndex(0);
+  
+  currentData.soilMoisture = analogRead(SOIL_PIN);
+  currentData.uvIntensity = analogRead(UV_PIN);
+  
+  currentData.time = rtc.now();
+  
+  // Расчёт скорости ветра
+  calculateWindSpeed();
+}
+
+void saveHourlyData() {
+  if (hourIndex < 24) {
+    hourlyData[hourIndex] = {
+      currentData.temperature,
+      currentData.humidity,
+      currentData.soilMoisture,
+      currentData.soilTemperature,
+      currentData.uvIntensity,
+      currentData.windSpeed,
+      currentData.time
+    };
+    hourIndex++;
+  } else {
+    // Сдвигаем массив
+    for (int i = 0; i < 23; i++) {
+      hourlyData[i] = hourlyData[i+1];
+    }
+    hourlyData[23] = {
+      currentData.temperature,
+      currentData.humidity,
+      currentData.soilMoisture,
+      currentData.soilTemperature,
+      currentData.uvIntensity,
+      currentData.windSpeed,
+      currentData.time
+    };
+  }
+}
+
+void calculate24hStatistics() {
+  float sumTemp = 0, sumHumidity = 0;
+  float maxTemp = -100, minTemp = 100;
+  int hoursAboveThreshold = 0;
+  
+  for (int i = 0; i < 24; i++) {
+    sumTemp += hourlyData[i].temperature;
+    sumHumidity += hourlyData[i].humidity;
+    
+    if (hourlyData[i].temperature > maxTemp) 
+      maxTemp = hourlyData[i].temperature;
+    if (hourlyData[i].temperature < minTemp) 
+      minTemp = hourlyData[i].temperature;
+    
+    // Часы с T≥10°C и H≥90%
+    if (hourlyData[i].temperature >= 10 && 
+        hourlyData[i].humidity >= 90) {
+      hoursAboveThreshold++;
+    }
+  }
+  
+  // Сохранение статистики
+  dailyStats.avgTemperature = sumTemp / 24;
+  dailyStats.avgHumidity = sumHumidity / 24;
+  dailyStats.maxTemperature = maxTemp;
+  dailyStats.minTemperature = minTemp;
+  dailyStats.hoursAboveThreshold = hoursAboveThreshold;
+}
+
+void sendDataViaZigbee() {
+  String dataPacket = "DATA,";
+  
+  // Добавляем временную метку
+  dataPacket += String(currentData.time.year()); dataPacket += ",";
+  dataPacket += String(currentData.time.month()); dataPacket += ",";
+  dataPacket += String(currentData.time.day()); dataPacket += ",";
+  dataPacket += String(currentData.time.hour()); dataPacket += ",";
+  dataPacket += String(currentData.time.minute()); dataPacket += ",";
+  
+  // Данные датчиков
+  dataPacket += String(currentData.temperature, 1); dataPacket += ",";
+  dataPacket += String(currentData.humidity, 0); dataPacket += ",";
+  dataPacket += String(currentData.soilTemperature, 1); dataPacket += ",";
+  dataPacket += String(currentData.soilMoisture); dataPacket += ",";
+  dataPacket += String(currentData.uvIntensity); dataPacket += ",";
+  dataPacket += String(currentData.windSpeed, 1); dataPacket += ",";
+  
+  // Статистика за 24 часа
+  dataPacket += String(dailyStats.avgTemperature, 1); dataPacket += ",";
+  dataPacket += String(dailyStats.avgHumidity, 0); dataPacket += ",";
+  dataPacket += String(dailyStats.maxTemperature, 1); dataPacket += ",";
+  dataPacket += String(dailyStats.minTemperature, 1); dataPacket += ",";
+  dataPacket += String(dailyStats.hoursAboveThreshold);
+  
+  // Отправка
+  Serial1.println(dataPacket);
+  
+  // Для отладки
+  Serial.println("Отправлено: " + dataPacket);
+}
+
+bool shouldSendData() {
+  static unsigned long lastSend = 0;
+  unsigned long currentTime = millis();
+  
+  // Отправка каждые 30 секунд
+  if (currentTime - lastSend >= 30000) {
+    lastSend = currentTime;
+    return true;
+  }
+  return false;
+}
+
+// Обработчик прерываний для анемометра
+volatile unsigned long windPulseCount = 0;
+unsigned long lastWindTime = 0;
+
+void countWindPulses() {
+  windPulseCount++;
+}
+
+void calculateWindSpeed() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastWindTime >= 2000) { // Каждые 2 секунды
+    detachInterrupt(digitalPinToInterrupt(WIND_PIN));
+    
+    // Формула: скорость = импульсы/сек * коэффициент
+    float timeSeconds = (currentTime - lastWindTime) / 1000.0;
+    float pulsesPerSecond = windPulseCount / timeSeconds;
+    currentData.windSpeed = pulsesPerSecond * 0.4; // Калибровочный коэффициент
+    
+    windPulseCount = 0;
+    lastWindTime = currentTime;
+    
+    attachInterrupt(digitalPinToInterrupt(WIND_PIN), countWindPulses, FALLING);
+  }
+}
+
+void checkForCommands() {
+  if (Serial1.available()) {
+    String command = Serial1.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "GET_DATA") {
+      sendDataViaZigbee();
+    }
+    else if (command == "GET_STATS") {
+      sendStatistics();
+    }
+    else if (command == "PING") {
+      Serial1.println("PONG");
+    }
+  }
+}
+
+void sendStatistics() {
+  String stats = "STATS,";
+  stats += String(dailyStats.avgTemperature, 1); stats += ",";
+  stats += String(dailyStats.avgHumidity, 0); stats += ",";
+  stats += String(dailyStats.maxTemperature, 1); stats += ",";
+  stats += String(dailyStats.minTemperature, 1); stats += ",";
+  stats += String(dailyStats.hoursAboveThreshold);
+  
+  Serial1.println(stats);
+}
